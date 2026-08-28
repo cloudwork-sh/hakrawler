@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -19,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gocolly/colly/v2"
-	"golang.org/x/sync/errgroup"
 )
 
 type Result struct {
@@ -29,12 +26,6 @@ type Result struct {
 }
 
 var headers map[string]string
-
-var bufPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
-}
 
 func main() {
 	inside := flag.Bool("i", false, "Only crawl inside path")
@@ -72,12 +63,10 @@ func main() {
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: *insecure},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:  10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: *insecure},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	if proxyURL != nil {
 		transport.Proxy = http.ProxyURL(proxyURL)
@@ -98,9 +87,11 @@ func main() {
 		close(inputURLs)
 	}()
 
-	g, _ := errgroup.WithContext(context.Background())
+	var wg sync.WaitGroup
 	for i := 0; i < *threads; i++ {
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			for rawURL := range inputURLs {
 				hostname, err := extractHostname(rawURL)
 				if err != nil {
@@ -174,13 +165,17 @@ func main() {
 					})
 				}
 
-				c.WithTransport(transport)
+				c.WithTransport(&http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure},
+					MaxIdleConns: 100,
+					MaxIdleConnsPerHost: 10,
+					IdleConnTimeout: 90 * time.Second,
+				})
 
 				if *timeout == -1 {
 					c.Visit(rawURL)
 					c.Wait()
 				} else {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 					finished := make(chan struct{}, 1)
 					go func() {
 						c.Visit(rawURL)
@@ -189,19 +184,16 @@ func main() {
 					}()
 					select {
 					case <-finished:
-						cancel()
-					case <-ctx.Done():
+					case <-time.After(time.Duration(*timeout) * time.Second):
 						log.Println("[timeout] " + rawURL)
-						cancel()
 					}
 				}
 			}
-			return nil
-		})
+		}()
 	}
 
 	go func() {
-		g.Wait()
+		wg.Wait()
 		close(done)
 		close(results)
 	}()
@@ -269,15 +261,12 @@ func printResult(link string, sourceName string, showSource bool, showWhere bool
 			if showWhere {
 				where = whereURL
 			}
-			buf := bufPool.Get().(*bytes.Buffer)
-			buf.Reset()
-			json.NewEncoder(buf).Encode(Result{
+			bytes, _ := json.Marshal(Result{
 				Source: sourceName,
 				URL:    result,
 				Where:  where,
 			})
-			result = buf.String()
-			bufPool.Put(buf)
+			result = string(bytes)
 		} else if showSource {
 			result = "[" + sourceName + "] " + result
 		}
